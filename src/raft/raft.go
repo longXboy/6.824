@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -134,8 +135,8 @@ type RequestAppendArgs struct {
 }
 
 type RequestAppendReply struct {
-	term        int
-	voteGranted bool
+	term    int
+	success bool
 }
 
 //
@@ -161,6 +162,39 @@ type RequestVoteReply struct {
 }
 
 func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply) {
+	if args.leaderId == rf.me {
+		panic(fmt.Errorf("leaderId should not be self!"))
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.term = rf.currentTerm
+	if args.term < rf.currentTerm {
+		return
+	} else if args.term == rf.currentTerm {
+		if rf.state == StateLeader {
+			panic(fmt.Errorf("two leaders in one term is forbidden!"))
+		}
+	} else if args.term > rf.currentTerm {
+		rf.changeState(StateFollower)
+		rf.leaderId = args.leaderId
+		rf.currentTerm = args.term
+	}
+	if len(args.entries) > 0 {
+		if len(rf.logs) > args.preLogIndex {
+			if args.preLogIndex == -1 || rf.logs[args.preLogIndex].Term == args.prevLogTerm {
+				l := rf.logs[args.preLogIndex+1:]
+				l = append(l, args.entries...)
+				reply.success = true
+			}
+		}
+	}
+	if args.leaderCommit > rf.commitIndex {
+		if args.leaderCommit < (len(rf.logs) - 1) {
+			rf.commitIndex = args.leaderCommit
+		} else {
+			rf.commitIndex = len(rf.logs) - 1
+		}
+	}
 }
 
 //
@@ -168,6 +202,9 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.candidateId == rf.me {
+		panic(fmt.Errorf("candidateId should not be self"))
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.term = rf.currentTerm
@@ -181,13 +218,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	} else {
 		rf.currentTerm = args.term
-		rf.electTimer.Reset(randDuration())
 		rf.changeState(StateFollower)
 		termChanged = true
 	}
 	if len(rf.logs) > args.lastLogIndex && rf.logs[args.lastLogIndex].Term == args.lastLogTerm {
 		if !termChanged {
-			rf.electTimer.Reset(randDuration())
 			rf.changeState(StateFollower)
 		}
 		rf.votedFor = args.candidateId
@@ -286,6 +321,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = make([]Log, 0)
 	rf.state = StateFollower
 	rf.votedFor = -1
+	rf.leaderId = -1
+	rf.commitIndex = -1
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.readPersist(persister.ReadRaftState())
 	rf.electTimer = time.AfterFunc(randDuration(), rf.electTimeOut)
@@ -296,7 +335,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) electTimeOut() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.electTimer.Reset(randDuration())
 	rf.currentTerm++
 	rf.changeState(StateCandidate)
 	for i := range rf.peers {
@@ -315,69 +353,158 @@ func (rf *Raft) electTimeOut() {
 func (rf *Raft) SendVote(server int, req *RequestVoteArgs) {
 	var reply RequestVoteReply
 	isok := rf.sendRequestVote(server, req, &reply)
-	rf.mu.Lock()
 	if isok {
+		rf.mu.Lock()
 		if reply.term > rf.currentTerm {
+			if reply.voteGranted {
+				panic(fmt.Errorf("vote reply sholud not be success while reciver's term < sender's term"))
+			}
 			rf.currentTerm = reply.term
 			rf.changeState(StateFollower)
-		} else if rf.currentTerm != req.term {
-			return
-		} else if reply.voteGranted && rf.state == StateCandidate {
+		} else if reply.voteGranted && rf.state == StateCandidate && rf.currentTerm == req.term {
 			rf.voteGrants++
 			if rf.voteGrants > len(rf.peers)/2 {
 				rf.changeState(StateLeader)
+				go rf.logAppend(rf.currentTerm)
 			}
 		}
 		rf.mu.Unlock()
 	} else if rf.state == StateCandidate && rf.currentTerm == req.term {
-		rf.mu.Unlock()
-		time.Sleep(time.Millisecond * 120)
-		rf.SendVote(server, req)
+		rf.mu.Lock()
+		if rf.state == StateCandidate {
+			rf.mu.Unlock()
+			time.Sleep(time.Millisecond * 150)
+			rf.SendVote(server, req)
+		} else {
+			rf.mu.Unlock()
+		}
 	}
 }
 
 func (rf *Raft) changeState(state State) {
 	rf.state = state
 	if state == StateFollower {
+		rf.electTimer.Reset(randDuration())
 		rf.votedFor = -1
 		rf.voteGrants = 0
+		rf.leaderId = -1
 	} else if state == StateCandidate {
+		rf.electTimer.Reset(randDuration())
 		rf.votedFor = rf.me
 		rf.voteGrants = 0
+		rf.leaderId = -1
 	} else if state == StateLeader {
-		rf.voteGrants = 0
 		rf.electTimer.Stop()
+		rf.voteGrants = 0
+		rf.leaderId = rf.me
+		for i := range rf.peers {
+			rf.nextIndex[i] = len(rf.logs)
+			rf.matchIndex[i] = -1
+		}
 	}
 }
 
-func (rf *Raft) heartBeat() {
-	for i := range rf.peers {
-		var entries []Log
-		var preLogIndex int = -1
-		var prevLogTerm int = -1
-		if rf.nextIndex[i] < len(rf.logs) {
-			entries = rf.logs[rf.nextIndex[i]:]
-			if rf.nextIndex[i] > 0 {
-				preLogIndex = rf.nextIndex[i] - 1
-				prevLogTerm = rf.logs[preLogIndex].Term
+func (rf *Raft) logAppend(term int) {
+	for {
+		rf.mu.Lock()
+		if rf.state != StateLeader || rf.currentTerm != term {
+			return
+		}
+		for i := range rf.peers {
+			var entries []Log
+			var preLogIndex int = -1
+			var prevLogTerm int = -1
+			if rf.nextIndex[i] < len(rf.logs) {
+				entries = rf.logs[rf.nextIndex[i]:]
+				if rf.nextIndex[i] > 0 {
+					preLogIndex = rf.nextIndex[i] - 1
+					prevLogTerm = rf.logs[preLogIndex].Term
+				}
 			}
+			req := RequestAppendArgs{
+				term:         rf.currentTerm,
+				leaderId:     rf.me,
+				preLogIndex:  preLogIndex,
+				prevLogTerm:  prevLogTerm,
+				entries:      entries,
+				leaderCommit: rf.commitIndex,
+			}
+			go rf.sendRequestAppend(i, &req)
 		}
-		req := RequestAppendArgs{
-			term:         rf.currentTerm,
-			leaderId:     rf.me,
-			preLogIndex:  preLogIndex,
-			prevLogTerm:  prevLogTerm,
-			entries:      entries,
-			leaderCommit: rf.commitIndex,
-		}
-		go rf.sendRequestAppend(&req)
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 150)
 	}
 }
 
-func (rf *Raft) sendRequestAppend(req *RequestAppendArgs) {
-	var reply RequestAppendReply
-	ok := rf.peers[i].Call("Raft.RequestAppend", req, &reply)
-	if ok {
+func (rf *Raft) sendRequestAppend(server int, req *RequestAppendArgs) {
+	for {
+		var reply RequestAppendReply
+		ok := rf.peers[server].Call("Raft.RequestAppend", req, &reply)
+		if ok {
+			rf.mu.Lock()
+			if rf.state != StateLeader {
+				rf.mu.Unlock()
+				return
+			} else if reply.term > rf.currentTerm {
+				if reply.success {
+					panic(fmt.Errorf("append reply sholud not be success while reciver's term < sender's term"))
+				}
+				rf.currentTerm = reply.term
+				rf.changeState(StateFollower)
+				rf.mu.Unlock()
+				return
+			}
+			if reply.success {
+				if req.preLogIndex+len(req.entries) >= rf.nextIndex[server] {
+					rf.nextIndex[server] = req.preLogIndex + len(req.entries) + 1
+				}
+				if req.preLogIndex+len(req.entries) > rf.matchIndex[server] {
+					rf.matchIndex[server] = req.preLogIndex + len(req.entries)
+
+					if rf.commitIndex < (len(rf.logs) - 1) {
+						for cmi := (rf.commitIndex + 1); cmi < len(rf.logs); cmi++ {
+							var total int
+							for _, mi := range rf.matchIndex {
+								if mi >= cmi {
+									total++
+								}
+							}
+							if total > len(rf.peers)/2 {
+								rf.commitIndex = cmi
+							} else {
+								break
+							}
+						}
+					}
+				}
+
+				rf.mu.Unlock()
+				return
+			} else {
+				if len(req.entries) > 0 && rf.nextIndex[server]-rf.matchIndex[server] > 1 && rf.nextIndex[server] > 0 {
+					rf.nextIndex[server]--
+					var entries []Log
+					var preLogIndex int = -1
+					var prevLogTerm int = -1
+					if rf.nextIndex[server] < len(rf.logs) {
+						entries = rf.logs[rf.nextIndex[server]:]
+						if rf.nextIndex[server] > 0 {
+							preLogIndex = rf.nextIndex[server] - 1
+							prevLogTerm = rf.logs[preLogIndex].Term
+						}
+					}
+					req.entries = entries
+					req.term = rf.currentTerm
+					req.leaderId = rf.me
+					req.preLogIndex = preLogIndex
+					req.prevLogTerm = prevLogTerm
+					req.leaderCommit = rf.commitIndex
+				}
+			}
+			rf.mu.Unlock()
+		} else {
+			return
+		}
 	}
 }
 
