@@ -17,13 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "labrpc"
 
 // import "bytes"
 // import "encoding/gob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -37,6 +39,18 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type Log struct {
+	Term    int
+	Command interface{}
+}
+type State int
+
+const (
+	StateFollower State = iota
+	StateLeader
+	StateCandidate
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -45,11 +59,22 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	state       State
+	leaderId    int
+	currentTerm int
+	votedFor    int
+	voteGrants  int
+	electTimer  *time.Timer
 
+	logs        []Log
+	commitIndex int
+	lastApplied int
+
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -59,6 +84,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	if rf.state == StateLeader {
+		isleader = true
+	}
 	return term, isleader
 }
 
@@ -93,8 +124,19 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+type RequestAppendArgs struct {
+	term         int
+	leaderId     int
+	preLogIndex  int
+	prevLogTerm  int
+	entries      []Log
+	leaderCommit int
+}
 
-
+type RequestAppendReply struct {
+	term        int
+	voteGranted bool
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -102,6 +144,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term         int
+	candidateId  int
+	lastLogIndex int
+	lastLogTerm  int
 }
 
 //
@@ -110,6 +156,11 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term        int
+	voteGranted bool
+}
+
+func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply) {
 }
 
 //
@@ -117,6 +168,32 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.term = rf.currentTerm
+	reply.voteGranted = false
+	termChanged := false
+	if args.term < rf.currentTerm {
+		return
+	} else if args.term == rf.currentTerm {
+		if rf.votedFor != -1 {
+			return
+		}
+	} else {
+		rf.currentTerm = args.term
+		rf.electTimer.Reset(randDuration())
+		rf.changeState(StateFollower)
+		termChanged = true
+	}
+	if len(rf.logs) > args.lastLogIndex && rf.logs[args.lastLogIndex].Term == args.lastLogTerm {
+		if !termChanged {
+			rf.electTimer.Reset(randDuration())
+			rf.changeState(StateFollower)
+		}
+		rf.votedFor = args.candidateId
+		reply.voteGranted = true
+	}
+	return
 }
 
 //
@@ -153,7 +230,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -173,7 +249,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -207,10 +282,106 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.logs = make([]Log, 0)
+	rf.state = StateFollower
+	rf.votedFor = -1
 
+	rf.readPersist(persister.ReadRaftState())
+	rf.electTimer = time.AfterFunc(randDuration(), rf.electTimeOut)
 
 	return rf
+}
+
+func (rf *Raft) electTimeOut() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.electTimer.Reset(randDuration())
+	rf.currentTerm++
+	rf.changeState(StateCandidate)
+	for i := range rf.peers {
+		if i != rf.me {
+			req := RequestVoteArgs{
+				term:         rf.currentTerm,
+				candidateId:  rf.me,
+				lastLogIndex: len(rf.logs) - 1,
+				lastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+			}
+			go rf.SendVote(i, &req)
+		}
+	}
+}
+
+func (rf *Raft) SendVote(server int, req *RequestVoteArgs) {
+	var reply RequestVoteReply
+	isok := rf.sendRequestVote(server, req, &reply)
+	rf.mu.Lock()
+	if isok {
+		if reply.term > rf.currentTerm {
+			rf.currentTerm = reply.term
+			rf.changeState(StateFollower)
+		} else if rf.currentTerm != req.term {
+			return
+		} else if reply.voteGranted && rf.state == StateCandidate {
+			rf.voteGrants++
+			if rf.voteGrants > len(rf.peers)/2 {
+				rf.changeState(StateLeader)
+			}
+		}
+		rf.mu.Unlock()
+	} else if rf.state == StateCandidate && rf.currentTerm == req.term {
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 120)
+		rf.SendVote(server, req)
+	}
+}
+
+func (rf *Raft) changeState(state State) {
+	rf.state = state
+	if state == StateFollower {
+		rf.votedFor = -1
+		rf.voteGrants = 0
+	} else if state == StateCandidate {
+		rf.votedFor = rf.me
+		rf.voteGrants = 0
+	} else if state == StateLeader {
+		rf.voteGrants = 0
+		rf.electTimer.Stop()
+	}
+}
+
+func (rf *Raft) heartBeat() {
+	for i := range rf.peers {
+		var entries []Log
+		var preLogIndex int = -1
+		var prevLogTerm int = -1
+		if rf.nextIndex[i] < len(rf.logs) {
+			entries = rf.logs[rf.nextIndex[i]:]
+			if rf.nextIndex[i] > 0 {
+				preLogIndex = rf.nextIndex[i] - 1
+				prevLogTerm = rf.logs[preLogIndex].Term
+			}
+		}
+		req := RequestAppendArgs{
+			term:         rf.currentTerm,
+			leaderId:     rf.me,
+			preLogIndex:  preLogIndex,
+			prevLogTerm:  prevLogTerm,
+			entries:      entries,
+			leaderCommit: rf.commitIndex,
+		}
+		go rf.sendRequestAppend(&req)
+	}
+}
+
+func (rf *Raft) sendRequestAppend(req *RequestAppendArgs) {
+	var reply RequestAppendReply
+	ok := rf.peers[i].Call("Raft.RequestAppend", req, &reply)
+	if ok {
+	}
+}
+
+func randDuration() time.Duration {
+	tn := rand.Intn(350) + 350
+	return time.Duration(int64(time.Millisecond) * int64(tn))
 }
