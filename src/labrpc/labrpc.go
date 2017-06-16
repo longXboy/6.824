@@ -50,7 +50,9 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "encoding/gob"
+import (
+	"encoding/gob"
+)
 import "bytes"
 import "reflect"
 import "sync"
@@ -91,7 +93,6 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	qe := gob.NewEncoder(qb)
 	qe.Encode(args)
 	req.args = qb.Bytes()
-
 	e.ch <- req
 
 	rep := <-req.replyCh
