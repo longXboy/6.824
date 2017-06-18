@@ -48,8 +48,8 @@ type State int
 
 const (
 	StateFollower State = iota
-	StateLeader
 	StateCandidate
+	StateLeader
 )
 
 //
@@ -126,17 +126,17 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 type RequestAppendArgs struct {
-	term         int
-	leaderId     int
-	preLogIndex  int
-	prevLogTerm  int
-	entries      []Log
-	leaderCommit int
+	Term         int
+	LeaderId     int
+	PreLogIndex  int
+	PrevLogTerm  int
+	Entries      []Log
+	LeaderCommit int
 }
 
 type RequestAppendReply struct {
-	term    int
-	success bool
+	Term    int
+	Success bool
 }
 
 //
@@ -144,10 +144,10 @@ type RequestAppendReply struct {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	term         int
-	candidateId  int
-	lastLogIndex int
-	lastLogTerm  int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -155,48 +155,47 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply) {
-	if args.leaderId == rf.me {
+	if args.LeaderId == rf.me {
 		panic(fmt.Errorf("leaderId should not be self!"))
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.term = rf.currentTerm
-	if args.term < rf.currentTerm {
+
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
 		return
-	} else if args.term == rf.currentTerm {
+	} else if args.Term == rf.currentTerm {
 		if rf.state == StateLeader {
-			panic(fmt.Errorf("two leaders in one term is forbidden!leaderId(%d) me(%d)", args.leaderId, rf.me))
-		} else if rf.state == StateCandidate {
+			panic(fmt.Errorf("two leaders in one term is forbidden!leaderId(%d) me(%d)", args.LeaderId, rf.me))
+		} else if rf.state == StateCandidate || rf.state == StateFollower {
 			rf.changeState(StateFollower)
-			rf.votedFor = args.leaderId
-			rf.leaderId = args.leaderId
-		} else {
-			rf.votedFor = args.leaderId
-			rf.leaderId = args.leaderId
+			rf.votedFor = args.LeaderId
+			rf.leaderId = args.LeaderId
 		}
-	} else if args.term > rf.currentTerm {
+	} else if args.Term > rf.currentTerm {
 		rf.changeState(StateFollower)
-		rf.leaderId = args.leaderId
-		rf.votedFor = args.leaderId
-		rf.currentTerm = args.term
+		rf.leaderId = args.LeaderId
+		rf.votedFor = args.LeaderId
+		rf.currentTerm = args.Term
 	}
-	if len(args.entries) > 0 {
-		if len(rf.logs) > args.preLogIndex {
-			if args.preLogIndex == -1 || rf.logs[args.preLogIndex].Term == args.prevLogTerm {
-				l := rf.logs[args.preLogIndex+1:]
-				l = append(l, args.entries...)
-				reply.success = true
+	if len(args.Entries) > 0 {
+		if len(rf.logs) > args.PreLogIndex {
+			if args.PreLogIndex == -1 || rf.logs[args.PreLogIndex].Term == args.PrevLogTerm {
+				l := rf.logs[args.PreLogIndex+1:]
+				l = append(l, args.Entries...)
+				reply.Success = true
 			}
 		}
 	}
-	if args.leaderCommit > rf.commitIndex {
-		if args.leaderCommit < (len(rf.logs) - 1) {
-			rf.commitIndex = args.leaderCommit
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < (len(rf.logs) - 1) {
+			rf.commitIndex = args.LeaderCommit
 		} else {
 			rf.commitIndex = len(rf.logs) - 1
 		}
@@ -208,38 +207,42 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	fmt.Printf("recv: candidated:%d me:%d reply:%p\n", args.candidateId, rf.me, reply)
-	if args.candidateId == rf.me {
+	if args.CandidateId == rf.me {
 		panic(fmt.Errorf("candidateId should not be self"))
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.term = rf.currentTerm
-	reply.voteGranted = false
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
 	termChanged := false
-	if args.term < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		return
-	} else if args.term == rf.currentTerm {
+	} else if args.Term == rf.currentTerm {
 		if rf.votedFor != -1 {
 			return
 		}
 	} else {
-		rf.currentTerm = args.term
+		rf.currentTerm = args.Term
 		rf.changeState(StateFollower)
 		termChanged = true
 	}
 	if len(rf.logs) != 0 {
-		if rf.logs[len(rf.logs)-1].Term > args.lastLogTerm {
+		if rf.logs[len(rf.logs)-1].Term > args.LastLogTerm {
 			return
-		} else if rf.logs[len(rf.logs)-1].Term == args.lastLogTerm && len(rf.logs)-1 > args.lastLogIndex {
+		} else if rf.logs[len(rf.logs)-1].Term == args.LastLogTerm && len(rf.logs)-1 > args.LastLogIndex {
 			return
 		}
 	}
 	if !termChanged {
 		rf.changeState(StateFollower)
 	}
-	rf.votedFor = args.candidateId
-	reply.voteGranted = true
+	rf.votedFor = args.CandidateId
+	reply.VoteGranted = true
+	reply.Term = rf.currentTerm
+	/*if args.CandidateId == 0 {
+		fmt.Printf("recv candiate 0 term:%d cTerm:%d self:%d\n", args.Term, rf.currentTerm, rf.me)
+	}*/
 	return
 }
 
@@ -273,7 +276,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	fmt.Printf("candidateId:%d me:%d server:%d\n", args.candidateId, rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -347,6 +349,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) electTimeOut() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	rf.currentTerm++
 	rf.changeState(StateCandidate)
 	for i := range rf.peers {
@@ -361,10 +364,10 @@ func (rf *Raft) electTimeOut() {
 				logTerm = rf.logs[index].Term
 			}
 			req := RequestVoteArgs{
-				term:         rf.currentTerm,
-				candidateId:  rf.me,
-				lastLogIndex: index,
-				lastLogTerm:  logTerm,
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: index,
+				LastLogTerm:  logTerm,
 			}
 			go rf.SendVote(i, req)
 		}
@@ -376,21 +379,24 @@ func (rf *Raft) SendVote(server int, req RequestVoteArgs) {
 	isok := rf.sendRequestVote(server, &req, &reply)
 	if isok {
 		rf.mu.Lock()
-		if reply.term > rf.currentTerm {
-			if reply.voteGranted {
+		fmt.Printf("send_vote:req_term:%d current_term:%d candidateId:%d to_server:%d reply:%v isok:%v\n", req.Term, rf.currentTerm, req.CandidateId, server, reply, isok)
+		if reply.Term > rf.currentTerm {
+			if reply.VoteGranted {
 				panic(fmt.Errorf("vote reply sholud not be success while reciver's term < sender's term"))
 			}
-			rf.currentTerm = reply.term
+			rf.currentTerm = reply.Term
 			rf.changeState(StateFollower)
-		} else if reply.voteGranted && rf.state == StateCandidate && rf.currentTerm == req.term {
+		} else if reply.VoteGranted && rf.state == StateCandidate && rf.currentTerm == req.Term {
 			rf.voteGrants++
+			fmt.Println(rf.voteGrants, len(rf.peers)/2)
 			if rf.voteGrants > len(rf.peers)/2 {
 				rf.changeState(StateLeader)
+				fmt.Printf("%d change to leader term:%d\n", rf.me, rf.currentTerm)
 				go rf.logAppend(rf.currentTerm)
 			}
 		}
 		rf.mu.Unlock()
-	} else if rf.state == StateCandidate && rf.currentTerm == req.term {
+	} else if rf.state == StateCandidate && rf.currentTerm == req.Term {
 		rf.mu.Lock()
 		if rf.state == StateCandidate {
 			rf.mu.Unlock()
@@ -403,7 +409,6 @@ func (rf *Raft) SendVote(server int, req RequestVoteArgs) {
 }
 
 func (rf *Raft) changeState(state State) {
-	rf.state = state
 	if state == StateFollower {
 		rf.electTimer.Reset(randDuration())
 		rf.votedFor = -1
@@ -412,11 +417,11 @@ func (rf *Raft) changeState(state State) {
 	} else if state == StateCandidate {
 		rf.electTimer.Reset(randDuration())
 		rf.votedFor = rf.me
-		rf.voteGrants = 0
+		rf.voteGrants = 1
 		rf.leaderId = -1
 	} else if state == StateLeader {
 		if rf.votedFor != rf.me || rf.state != StateCandidate {
-			panic(fmt.Errorf("can't switch to leader with invalid state voteFor(%d) state(%d)", rf.votedFor, rf.state))
+			panic(fmt.Errorf("can't switch to leader with invalid state voteFor(%d) me(%d) state(%d)", rf.votedFor, rf.me, rf.state))
 		}
 		rf.electTimer.Stop()
 		rf.voteGrants = 0
@@ -426,15 +431,22 @@ func (rf *Raft) changeState(state State) {
 			rf.matchIndex[i] = -1
 		}
 	}
+	rf.state = state
 }
 
 func (rf *Raft) logAppend(term int) {
 	for {
 		rf.mu.Lock()
 		if rf.state != StateLeader || rf.currentTerm != term {
+			rf.mu.Unlock()
 			return
 		}
+		/*
+			fmt.Println("leader:", rf.me)*/
 		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
 			var entries []Log
 			var preLogIndex int = -1
 			var prevLogTerm int = -1
@@ -446,12 +458,12 @@ func (rf *Raft) logAppend(term int) {
 				}
 			}
 			req := RequestAppendArgs{
-				term:         rf.currentTerm,
-				leaderId:     rf.me,
-				preLogIndex:  preLogIndex,
-				prevLogTerm:  prevLogTerm,
-				entries:      entries,
-				leaderCommit: rf.commitIndex,
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PreLogIndex:  preLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
 			}
 			go rf.sendRequestAppend(i, req)
 		}
@@ -465,21 +477,21 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 	defer rf.mu.Unlock()
 	if rf.state != StateLeader {
 		return false
-	} else if reply.term > rf.currentTerm {
-		if reply.success {
+	} else if reply.Term > rf.currentTerm {
+		if reply.Success {
 			panic(fmt.Errorf("append reply sholud not be success while follower's term > leader's term"))
 		}
-		rf.currentTerm = reply.term
+		rf.currentTerm = reply.Term
 		rf.changeState(StateFollower)
 		return false
 	}
 
-	if reply.success {
-		if req.preLogIndex+len(req.entries) >= rf.nextIndex[server] {
-			rf.nextIndex[server] = req.preLogIndex + len(req.entries) + 1
+	if reply.Success {
+		if req.PreLogIndex+len(req.Entries) >= rf.nextIndex[server] {
+			rf.nextIndex[server] = req.PreLogIndex + len(req.Entries) + 1
 		}
-		if req.preLogIndex+len(req.entries) > rf.matchIndex[server] {
-			rf.matchIndex[server] = req.preLogIndex + len(req.entries)
+		if req.PreLogIndex+len(req.Entries) > rf.matchIndex[server] {
+			rf.matchIndex[server] = req.PreLogIndex + len(req.Entries)
 
 			if rf.commitIndex < (len(rf.logs) - 1) {
 				for cmi := (rf.commitIndex + 1); cmi < len(rf.logs); cmi++ {
@@ -499,7 +511,7 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 		}
 		return false
 	} else {
-		if len(req.entries) > 0 && rf.nextIndex[server]-rf.matchIndex[server] > 1 && rf.nextIndex[server] > 0 {
+		if len(req.Entries) > 0 && rf.nextIndex[server]-rf.matchIndex[server] > 1 && rf.nextIndex[server] > 0 {
 			rf.nextIndex[server]--
 			var entries []Log
 			var preLogIndex int = -1
@@ -511,12 +523,12 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 					prevLogTerm = rf.logs[preLogIndex].Term
 				}
 			}
-			req.entries = entries
-			req.term = rf.currentTerm
-			req.leaderId = rf.me
-			req.preLogIndex = preLogIndex
-			req.prevLogTerm = prevLogTerm
-			req.leaderCommit = rf.commitIndex
+			req.Entries = entries
+			req.Term = rf.currentTerm
+			req.LeaderId = rf.me
+			req.PreLogIndex = preLogIndex
+			req.PrevLogTerm = prevLogTerm
+			req.LeaderCommit = rf.commitIndex
 			return true
 		}
 	}
