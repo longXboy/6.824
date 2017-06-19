@@ -217,6 +217,7 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 		} else {
 			rf.commitIndex = len(rf.logs) - 1
 		}
+		fmt.Printf("follower(%d) commit:%d term:%d\n", rf.me, rf.commitIndex, rf.currentTerm)
 		for i := previous + 1; i <= rf.commitIndex; i++ {
 			rf.apply(i)
 		}
@@ -318,7 +319,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := false
 	if rf.state == StateLeader {
-		fmt.Println("recv cmd:", command, "who:", rf.me, "term:", rf.currentTerm)
+		//fmt.Println("recv cmd:", command, "who:", rf.me, "term:", rf.currentTerm)
 		isLeader = true
 		rf.logs = append(rf.logs, Log{rf.currentTerm, command})
 	}
@@ -366,7 +367,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = make(chan ApplyMsg, 10240)
 
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Lock()
 	rf.electTimer = time.AfterFunc(randDuration(), rf.electTimeOut)
+	rf.mu.Unlock()
 
 	go func() {
 		for log := range rf.applyCh {
@@ -409,7 +412,7 @@ func (rf *Raft) SendVote(server int, req RequestVoteArgs) {
 	isok := rf.sendRequestVote(server, &req, &reply)
 	rf.mu.Lock()
 	if isok {
-		fmt.Printf("(%d) req vote from server(%d) term:(%d)\n", rf.me, server, rf.currentTerm)
+		//fmt.Printf("(%d) req vote from server(%d) term:(%d)\n", rf.me, server, rf.currentTerm)
 		if reply.Term > rf.currentTerm {
 			if reply.VoteGranted {
 				panic(fmt.Errorf("vote reply sholud not be success while reciver's term < sender's term"))
@@ -444,6 +447,7 @@ func (rf *Raft) changeState(state State) {
 		rf.voteGrants = 1
 		rf.leaderId = -1
 	} else if state == StateLeader {
+		fmt.Println("switch to leader:", rf.me, "term:", rf.currentTerm)
 		if rf.votedFor != rf.me || rf.state != StateCandidate {
 			panic(fmt.Errorf("can't switch to leader with invalid state voteFor(%d) me(%d) state(%d)", rf.votedFor, rf.me, rf.state))
 		}
@@ -470,29 +474,9 @@ func (rf *Raft) logAppend(term int) {
 			if i == rf.me {
 				continue
 			}
-			var entries []Log
-			var preLogIndex int = -1
-			var prevLogTerm int = -1
-			if rf.nextIndex[i] < len(rf.logs) {
-				entries = rf.logs[rf.nextIndex[i]:]
-				if rf.nextIndex[i] > 0 {
-					preLogIndex = rf.nextIndex[i] - 1
-					prevLogTerm = rf.logs[preLogIndex].Term
-				}
-			}
-			commitId := rf.commitIndex
-			if rf.matchIndex[i] < rf.commitIndex {
-				commitId = rf.matchIndex[i]
-			}
-			req := RequestAppendArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PreLogIndex:  preLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: commitId,
-			}
-			go rf.sendRequestAppend(i, req)
+			var req RequestAppendArgs
+			rf.fillUpAppendReq(i, &req)
+			go rf.sendRequestAppend(i, &req)
 		}
 		rf.mu.Unlock()
 		time.Sleep(time.Millisecond * 120)
@@ -501,7 +485,7 @@ func (rf *Raft) logAppend(term int) {
 
 func (rf *Raft) apply(index int) {
 	for i := rf.lastApplied; i <= index; i++ {
-		fmt.Println("apply:", i+1, "who:", rf.me, "term:", rf.currentTerm, "cmd:", rf.logs[i].Command)
+		//fmt.Println("apply:", i+1, "who:", rf.me, "term:", rf.currentTerm, "cmd:", rf.logs[i].Command)
 		rf.applyCh <- ApplyMsg{
 			Index:   i + 1,
 			Command: rf.logs[i].Command,
@@ -547,7 +531,8 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 					}
 					if total > len(rf.peers)/2 {
 						rf.commitIndex = cmi
-						fmt.Println("cmIdx:", cmi, "self:", rf.me, "term:", rf.currentTerm, "cmd:", rf.logs[cmi].Command)
+						fmt.Printf("ledaer(%d) commit:%d term:%d\n", rf.me, rf.commitIndex, rf.currentTerm)
+						//fmt.Println("cmIdx:", cmi, "self:", rf.me, "term:", rf.currentTerm, "cmd:", rf.logs[cmi].Command)
 						rf.apply(cmi)
 					} else {
 						break
@@ -559,34 +544,44 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 	} else {
 		if len(req.Entries) > 0 && rf.nextIndex[server]-rf.matchIndex[server] > 1 && rf.nextIndex[server] > 0 {
 			rf.nextIndex[server]--
-			var entries []Log
-			var preLogIndex int = -1
-			var prevLogTerm int = -1
-			if rf.nextIndex[server] < len(rf.logs) {
-				entries = rf.logs[rf.nextIndex[server]:]
-				if rf.nextIndex[server] > 0 {
-					preLogIndex = rf.nextIndex[server] - 1
-					prevLogTerm = rf.logs[preLogIndex].Term
-				}
-			}
-			req.Entries = entries
-			req.Term = rf.currentTerm
-			req.LeaderId = rf.me
-			req.PreLogIndex = preLogIndex
-			req.PrevLogTerm = prevLogTerm
-			req.LeaderCommit = rf.commitIndex
+			rf.fillUpAppendReq(server, req)
 			return true
 		}
 	}
 	return false
 }
 
-func (rf *Raft) sendRequestAppend(server int, req RequestAppendArgs) {
+func (rf *Raft) fillUpAppendReq(server int, req *RequestAppendArgs) {
+	var entries []Log
+	var preLogIndex int = -1
+	var prevLogTerm int = -1
+	if rf.nextIndex[server] < len(rf.logs) {
+		temp := rf.logs[rf.nextIndex[server]:]
+		entries = make([]Log, len(temp))
+		copy(entries, temp)
+		if rf.nextIndex[server] > 0 {
+			preLogIndex = rf.nextIndex[server] - 1
+			prevLogTerm = rf.logs[preLogIndex].Term
+		}
+	}
+	commitId := rf.commitIndex
+	if rf.matchIndex[server] < rf.commitIndex {
+		commitId = rf.matchIndex[server]
+	}
+	req.Entries = entries
+	req.Term = rf.currentTerm
+	req.LeaderId = rf.me
+	req.PreLogIndex = preLogIndex
+	req.PrevLogTerm = prevLogTerm
+	req.LeaderCommit = commitId
+}
+
+func (rf *Raft) sendRequestAppend(server int, req *RequestAppendArgs) {
 	for {
 		var reply RequestAppendReply
-		ok := rf.peers[server].Call("Raft.RequestAppend", &req, &reply)
+		ok := rf.peers[server].Call("Raft.RequestAppend", req, &reply)
 		if ok {
-			if !rf.handleAppendReply(server, &req, &reply) {
+			if !rf.handleAppendReply(server, req, &reply) {
 				return
 			}
 		} else {
