@@ -41,6 +41,7 @@ type ApplyMsg struct {
 }
 
 type Log struct {
+	Index   int
 	Term    int
 	Command interface{}
 }
@@ -63,12 +64,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state       State
-	leaderId    int
-	currentTerm int
-	votedFor    int
-	voteGrants  int
-	electTimer  *time.Timer
+	state         State
+	leaderId      int
+	currentTerm   int
+	votedFor      int
+	voteGrants    int
+	electTimer    *time.Timer
+	lastHeartBeat int64
 
 	logs        []Log
 	commitIndex int
@@ -222,6 +224,8 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 			rf.apply(i)
 		}
 	}
+
+	rf.lastHeartBeat = time.Now().UnixNano()
 }
 
 //
@@ -238,6 +242,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	termChanged := false
+	//reject vote req without real timeout
+	if time.Now().UnixNano()-rf.lastHeartBeat < int64(time.Millisecond*300) {
+		return
+	}
 	if args.Term < rf.currentTerm {
 		return
 	} else if args.Term == rf.currentTerm {
@@ -321,7 +329,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state == StateLeader {
 		//fmt.Println("recv cmd:", command, "who:", rf.me, "term:", rf.currentTerm)
 		isLeader = true
-		rf.logs = append(rf.logs, Log{rf.currentTerm, command})
+		if len(rf.logs) == 0 {
+			rf.logs = []Log{Log{0, rf.currentTerm, command}}
+		} else {
+			lastIndex := rf.logs[len(rf.logs)-1].Index
+			rf.logs = append(rf.logs, Log{lastIndex + 1, rf.currentTerm, command})
+
+		}
 	}
 	// Your code here (2B).
 
