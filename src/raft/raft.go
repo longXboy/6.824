@@ -18,15 +18,14 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
+	"labrpc"
 	"math/rand"
 	"sync"
 	"time"
 )
-import "labrpc"
-
-// import "bytes"
-// import "encoding/gob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -103,28 +102,31 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastApplied)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+
+	if len(data) > 0 { // bootstrap without any state?
+		r := bytes.NewBuffer(data)
+		d := gob.NewDecoder(r)
+		d.Decode(&rf.currentTerm)
+		d.Decode(&rf.votedFor)
+		d.Decode(&rf.commitIndex)
+		d.Decode(&rf.lastApplied)
+		d.Decode(&rf.logs)
 	}
 }
 
@@ -138,8 +140,9 @@ type RequestAppendArgs struct {
 }
 
 type RequestAppendReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	PrevTermIndex int
 }
 
 //
@@ -183,15 +186,23 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	isChanged := false
+	reply.PrevTermIndex = -2
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		if reply.PrevTermIndex == 0 {
+			fmt.Println("got reply.prevTermIndex==0")
+		}
 		return
 	} else if args.Term == rf.currentTerm {
 		if rf.state == StateLeader {
 			panic(fmt.Errorf("two leaders in one term is forbidden!leaderId(%d) me(%d)", args.LeaderId, rf.me))
 		} else if rf.state == StateCandidate || rf.state == StateFollower {
 			rf.changeState(StateFollower)
-			rf.votedFor = args.LeaderId
+			if rf.votedFor != args.LeaderId {
+				isChanged = true
+				rf.votedFor = args.LeaderId
+			}
 			rf.leaderId = args.LeaderId
 		}
 	} else if args.Term > rf.currentTerm {
@@ -199,17 +210,35 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 		rf.leaderId = args.LeaderId
 		rf.votedFor = args.LeaderId
 		rf.currentTerm = args.Term
+		isChanged = true
 	}
 	reply.Term = rf.currentTerm
 	if len(args.Entries) > 0 {
 		if len(rf.logs) > args.PreLogIndex {
 			if args.PreLogIndex == -1 || rf.logs[args.PreLogIndex].Term == args.PrevLogTerm {
 				if args.PreLogIndex < rf.commitIndex {
-					panic(fmt.Errorf("committed command(%d) can't be overwritten by append entry (%d),it must be same", rf.commitIndex, args.PreLogIndex))
+					reply.Success = true
+					panic(fmt.Errorf("%d committed command(%d,%d) can't be overwritten (%d,%d,%d) by %d", rf.me, rf.logs[rf.commitIndex].Term, rf.commitIndex, args.PrevLogTerm, args.PreLogIndex, len(args.Entries), args.LeaderId))
+				} else {
+					rf.addEntries(args.PreLogIndex, args.Entries)
+					reply.Success = true
+					isChanged = true
 				}
-				rf.addEntries(args.PreLogIndex, args.Entries)
-				reply.Success = true
+			} else if args.PreLogIndex > 0 {
+				aTerm := rf.logs[args.PreLogIndex].Term
+				for i := args.PreLogIndex; i >= rf.commitIndex && i >= 0; i-- {
+					if rf.logs[i].Term != aTerm {
+						reply.PrevTermIndex = i
+						break
+					}
+				}
+				if reply.PrevTermIndex == -2 {
+					reply.PrevTermIndex = rf.commitIndex
+				}
+				fmt.Printf("%d shrink to %d,term:%d\n", rf.me, reply.PrevTermIndex, rf.currentTerm)
 			}
+		} else {
+			reply.PrevTermIndex = len(rf.logs) - 1
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
@@ -223,8 +252,11 @@ func (rf *Raft) RequestAppend(args *RequestAppendArgs, reply *RequestAppendReply
 		for i := previous + 1; i <= rf.commitIndex; i++ {
 			rf.apply(i)
 		}
+		isChanged = true
 	}
-
+	if isChanged {
+		rf.persist()
+	}
 	rf.lastHeartBeat = time.Now().UnixNano()
 }
 
@@ -256,6 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.changeState(StateFollower)
 		termChanged = true
+		rf.persist()
 	}
 	if len(rf.logs) != 0 {
 		if rf.logs[len(rf.logs)-1].Term > args.LastLogTerm {
@@ -270,6 +303,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
+	rf.persist()
 	return
 }
 
@@ -334,8 +368,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		} else {
 			lastIndex := rf.logs[len(rf.logs)-1].Index
 			rf.logs = append(rf.logs, Log{lastIndex + 1, rf.currentTerm, command})
-
 		}
+		rf.persist()
 	}
 	// Your code here (2B).
 
@@ -399,6 +433,7 @@ func (rf *Raft) electTimeOut() {
 
 	rf.currentTerm++
 	rf.changeState(StateCandidate)
+	rf.persist()
 	for i := range rf.peers {
 		if i != rf.me {
 			var index int
@@ -433,6 +468,7 @@ func (rf *Raft) SendVote(server int, req RequestVoteArgs) {
 			}
 			rf.currentTerm = reply.Term
 			rf.changeState(StateFollower)
+			rf.persist()
 		} else if reply.VoteGranted && rf.state == StateCandidate && rf.currentTerm == req.Term {
 			rf.voteGrants++
 			if rf.voteGrants > len(rf.peers)/2 {
@@ -506,6 +542,7 @@ func (rf *Raft) apply(index int) {
 		}
 	}
 	rf.lastApplied = index + 1
+	rf.persist()
 	return
 }
 
@@ -520,6 +557,7 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 		}
 		rf.currentTerm = reply.Term
 		rf.changeState(StateFollower)
+		rf.persist()
 		return false
 	}
 
@@ -529,14 +567,14 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 		}
 		if req.PreLogIndex+len(req.Entries) > rf.matchIndex[server] {
 			rf.matchIndex[server] = req.PreLogIndex + len(req.Entries)
-
+			isChanged := false
 			if rf.commitIndex < (len(rf.logs) - 1) {
 				for cmi := (rf.commitIndex + 1); cmi < len(rf.logs); cmi++ {
 					if rf.logs[cmi].Term != rf.currentTerm {
 						//prevoius log can't be committed,should committed by append new
 						continue
 					}
-					//current leader's log contains the log
+					//current leader's log must contains the log
 					var total int = 1
 					for _, mi := range rf.matchIndex {
 						if mi >= cmi {
@@ -548,16 +586,27 @@ func (rf *Raft) handleAppendReply(server int, req *RequestAppendArgs, reply *Req
 						fmt.Printf("ledaer(%d) commit:%d term:%d\n", rf.me, rf.commitIndex, rf.currentTerm)
 						//fmt.Println("cmIdx:", cmi, "self:", rf.me, "term:", rf.currentTerm, "cmd:", rf.logs[cmi].Command)
 						rf.apply(cmi)
+						isChanged = true
 					} else {
 						break
 					}
+				}
+				if isChanged {
+					rf.persist()
 				}
 			}
 		}
 		return false
 	} else {
 		if len(req.Entries) > 0 && rf.nextIndex[server]-rf.matchIndex[server] > 1 && rf.nextIndex[server] > 0 {
-			rf.nextIndex[server]--
+			if reply.PrevTermIndex != -2 {
+				//rf.nextIndex[server]--
+				rf.nextIndex[server] = reply.PrevTermIndex + 1
+				fmt.Printf("%d recv shrink to %d term %d ct: %d\n", rf.me, reply.PrevTermIndex, reply.Term, rf.currentTerm)
+			} else {
+				rf.nextIndex[server]--
+				fmt.Printf("%d minus to %d term %d ct: %d \n", rf.me, rf.nextIndex[server]-1, reply.Term, rf.currentTerm)
+			}
 			rf.fillUpAppendReq(server, req)
 			return true
 		}
