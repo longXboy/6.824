@@ -3,6 +3,7 @@ package mapreduce
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 //
@@ -14,27 +15,43 @@ import (
 // suitable for passing to call(). registerChan will yield all
 // existing registered workers (if any) and new ones as they register.
 //
-type Compelete struct {
+type Recycle struct {
 	addr    string
 	success bool
 }
 
-func doTask(arg DoTaskArgs, workerCh chan string, addr string, group *sync.WaitGroup) {
+func doTask(arg DoTaskArgs, workerCh chan string, recycleCh chan Recycle, group *sync.WaitGroup) {
 	for {
-		sucess := call(addr, "Worker.DoTask", &arg, nil)
-		workerCh <- addr
-		if sucess {
+		addr := <-workerCh
+		success := call(addr, "Worker.DoTask", &arg, nil)
+		r := Recycle{addr: addr, success: success}
+		recycleCh <- r
+		if success {
 			break
 		}
 	}
 	group.Done()
 }
 
-func dispatch(registerChan chan string, workerCh chan string, c chan struct{}) {
+func dispatch(registerChan chan string, workerCh chan string, recycleCh chan Recycle, c chan struct{}) {
+	ticker := time.NewTicker(time.Second * 10)
+	defer ticker.Stop()
+	recycles := make([]string, 0)
 	for {
 		select {
+		case _ = <-ticker.C:
+			if len(recycles) != 0 {
+				workerCh <- recycles[0]
+				recycles = recycles[1:]
+			}
 		case addr := <-registerChan:
 			workerCh <- addr
+		case r := <-recycleCh:
+			if r.success {
+				workerCh <- r.addr
+			} else {
+				recycles = append(recycles, r.addr)
+			}
 		case <-c:
 			return
 		}
@@ -43,6 +60,7 @@ func dispatch(registerChan chan string, workerCh chan string, c chan struct{}) {
 }
 
 func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
+	fmt.Println(" in phase")
 	sig := make(chan struct{})
 	group := &sync.WaitGroup{}
 	var ntasks int
@@ -52,10 +70,11 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		ntasks = len(mapFiles)
 		n_other = nReduce
 		workerCh := make(chan string, ntasks)
-		go dispatch(registerChan, workerCh, sig)
+		recycleCh := make(chan Recycle, ntasks)
+
+		go dispatch(registerChan, workerCh, recycleCh, sig)
 		for taskNo := range mapFiles {
 			group.Add(1)
-			addr := <-workerCh
 			var arg DoTaskArgs = DoTaskArgs{
 				JobName:       jobName,
 				File:          mapFiles[taskNo],
@@ -63,16 +82,17 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				TaskNumber:    taskNo,
 				NumOtherPhase: n_other,
 			}
-			go doTask(arg, workerCh, addr, group)
+			go doTask(arg, workerCh, recycleCh, group)
 		}
 	case reducePhase:
 		ntasks = nReduce
 		n_other = len(mapFiles)
 		workerCh := make(chan string, ntasks)
-		go dispatch(registerChan, workerCh, sig)
+		recycleCh := make(chan Recycle, ntasks)
+
+		go dispatch(registerChan, workerCh, recycleCh, sig)
 		for taskNo := 0; taskNo < nReduce; taskNo++ {
 			group.Add(1)
-			addr := <-workerCh
 			var arg DoTaskArgs = DoTaskArgs{
 				JobName:       jobName,
 				File:          "",
@@ -80,7 +100,7 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				TaskNumber:    taskNo,
 				NumOtherPhase: n_other,
 			}
-			go doTask(arg, workerCh, addr, group)
+			go doTask(arg, workerCh, recycleCh, group)
 		}
 	}
 	group.Wait()

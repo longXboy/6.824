@@ -1,6 +1,11 @@
 package main
 
-import "os"
+import (
+	"os"
+	"sort"
+	"strings"
+	"unicode"
+)
 import "fmt"
 import "mapreduce"
 
@@ -9,6 +14,13 @@ import "mapreduce"
 // and the value is the file's contents. The return value should be a slice of
 // key/value pairs, each represented by a mapreduce.KeyValue.
 func mapF(document string, value string) (res []mapreduce.KeyValue) {
+	s := strings.FieldsFunc(value, func(r rune) bool {
+		return !unicode.IsLetter(r)
+	})
+	for _, data := range s {
+		res = append(res, mapreduce.KeyValue{Key: data, Value: document})
+	}
+	return
 	// TODO: you should complete this to do the inverted index challenge
 }
 
@@ -17,6 +29,22 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 // should be a single output value for that key.
 func reduceF(key string, values []string) string {
 	// TODO: you should complete this to do the inverted index challenge
+	sort.Slice(values, func(i, j int) bool {
+		return values[i] < values[j]
+	})
+
+	filters := make([]string, 0)
+	last := ""
+	for i := range values {
+		if values[i] != last {
+			filters = append(filters, values[i])
+			last = values[i]
+		}
+	}
+	douments := strings.Join(filters, ",")
+
+	return fmt.Sprintf("%d %s", len(filters), douments)
+
 }
 
 // Can be run in 3 ways:
